@@ -1,0 +1,8 @@
+openai>=1.0
+opencv-python>=4.9
+Pillow>=10.0
+pyserial>=3.5
+python-dotenv>=1.0
+flask>=3.0
+flask-socketio>=5.3
+
