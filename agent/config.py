@@ -113,3 +113,58 @@ def load_profile(name: str) -> str:
         return ""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+_LEARNED_HEADER = "LEARNED FROM EXPERIENCE:"
+_MAX_LESSONS = 10
+
+
+def add_lesson(profile_name: str, lesson: str) -> bool:
+    """Append a one-line lesson to a profile's LEARNED section.
+
+    Deduplicates by checking word overlap with existing lessons.
+    Keeps at most _MAX_LESSONS entries (FIFO).
+    Returns True if the lesson was added.
+    """
+    if not profile_name:
+        return False
+    path = os.path.join(PROFILES_DIR, f"{profile_name}.txt")
+    if not os.path.exists(path):
+        return False
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Parse existing lessons
+    lessons: list[str] = []
+    if _LEARNED_HEADER in content:
+        base, _, learned_block = content.partition(_LEARNED_HEADER)
+        base = base.rstrip()
+        for line in learned_block.strip().splitlines():
+            line = line.strip()
+            if line.startswith("- "):
+                lessons.append(line[2:])
+    else:
+        base = content.rstrip()
+
+    # Deduplicate — skip if >50% word overlap with any existing lesson
+    new_words = set(lesson.lower().split())
+    for existing in lessons:
+        existing_words = set(existing.lower().split())
+        if not new_words or not existing_words:
+            continue
+        overlap = len(new_words & existing_words) / min(len(new_words), len(existing_words))
+        if overlap > 0.5:
+            return False  # too similar to existing
+
+    # Add and cap
+    lessons.append(lesson)
+    if len(lessons) > _MAX_LESSONS:
+        lessons = lessons[-_MAX_LESSONS:]
+
+    # Write back
+    learned_text = "\n".join(f"- {l}" for l in lessons)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{base}\n\n{_LEARNED_HEADER}\n{learned_text}\n")
+
+    return True

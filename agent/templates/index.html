@@ -193,6 +193,7 @@
                     <input type="text" id="taskInput"
                            placeholder="Tell the agent what to do on the locked PC…" autofocus />
                     <button class="btn-send" id="btnSend">Send</button>
+                    <button id="btnNewTask" style="display:none;padding:12px 20px;border:none;cursor:pointer;font-size:13px;font-weight:600;background:#4caf50;color:#fff">New Task</button>
                     <button class="btn-stop" id="btnStop" disabled>Stop</button>
                 </div>
             </div>
@@ -322,12 +323,24 @@
             costDisplay.textContent = '$' + data.total_cost.toFixed(4);
         });
 
+        const btnNewTask = document.getElementById('btnNewTask');
+
         socket.on('status', (data) => {
             running = data.running;
             statusDot.classList.toggle('running', running);
-            btnSend.disabled = running;
             btnStop.disabled = !running;
-            taskInput.disabled = running;
+            taskInput.disabled = false;
+            if (running) {
+                btnSend.textContent = 'Guide';
+                btnSend.style.background = '#ff9800';
+                btnNewTask.style.display = '';
+                taskInput.placeholder = 'Guide the agent or type a new task…';
+            } else {
+                btnSend.textContent = 'Send';
+                btnSend.style.background = '#4caf50';
+                btnNewTask.style.display = 'none';
+                taskInput.placeholder = 'Tell the agent what to do on the locked PC…';
+            }
         });
 
         socket.on('task_log', (data) => {
@@ -351,11 +364,28 @@
         });
 
         // --- controls ---
+        function sendNewTask(text) {
+            appendLog('> ' + text, 'user-msg');
+            socket.emit('start_task', { task: text });
+            taskInput.value = '';
+        }
+
         btnSend.addEventListener('click', () => {
-            const task = taskInput.value.trim();
-            if (!task) return;
-            appendLog('> ' + task, 'user-msg');
-            socket.emit('start_task', { task });
+            const text = taskInput.value.trim();
+            if (!text) return;
+            if (running) {
+                // Live guidance mode
+                socket.emit('send_guidance', { message: text });
+                taskInput.value = '';
+            } else {
+                sendNewTask(text);
+            }
+        });
+
+        btnNewTask.addEventListener('click', () => {
+            const text = taskInput.value.trim();
+            if (!text) return;
+            sendNewTask(text);
         });
 
         btnStop.addEventListener('click', () => {
@@ -363,8 +393,14 @@
         });
 
         taskInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !running) {
-                btnSend.click();
+            if (e.key === 'Enter') {
+                if (e.shiftKey && running) {
+                    // Shift+Enter while running = new task
+                    const text = taskInput.value.trim();
+                    if (text) sendNewTask(text);
+                } else {
+                    btnSend.click();
+                }
             }
         });
 

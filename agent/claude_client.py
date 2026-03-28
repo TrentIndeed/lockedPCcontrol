@@ -53,6 +53,10 @@ class ClaudeClient:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
 
+        # stuck state — set by _build_input, read by caller for learning
+        self.was_stuck: bool = False
+        self.stuck_context: str = ""  # OBSERVE text when stuck started
+
     # -- public API ----------------------------------------------------------
 
     def decide(
@@ -156,9 +160,8 @@ class ClaudeClient:
             f"session=${c['total_cost']:.4f}"
         )
 
-    @staticmethod
     def _build_input(
-        task: str, screenshot_b64: str, history: list[dict],
+        self, task: str, screenshot_b64: str, history: list[dict],
     ) -> list[dict]:
         messages: list[dict] = []
 
@@ -176,6 +179,7 @@ class ClaudeClient:
         # stuck detection — looks at click targets in a wider window,
         # ignoring keyboard actions in between
         stuck_warning = ""
+        self.was_stuck = False
         if len(history) >= 3:
             def extract_click_bucket(text: str) -> tuple | None:
                 """Return (x_bucket, y_bucket) for click actions, None for non-clicks."""
@@ -193,22 +197,26 @@ class ClaudeClient:
                 y = obj.get("y", -999)
                 return (x // 40, y // 40)
 
-            # Extract click targets from last 6 actions (ignoring non-clicks)
+            # Extract click targets from last 8 actions (ignoring non-clicks)
             recent_clicks = []
-            for h in history[-6:]:
+            for h in history[-8:]:
                 bucket = extract_click_bucket(h["assistant"])
                 if bucket is not None:
                     recent_clicks.append(bucket)
 
-            # If 2+ of the recent clicks target the same area, we're stuck
+            # Count unique click positions — if clicking DIFFERENT spots,
+            # the AI is exploring (e.g. clicking hotspots 1,2,3) not stuck
+            unique_positions = len(set(recent_clicks))
+
+            # Stuck = 3+ clicks in the same 40px bucket (truly repeating)
             is_stuck = False
-            if len(recent_clicks) >= 2:
+            if len(recent_clicks) >= 3:
                 from collections import Counter
                 most_common_bucket, count = Counter(recent_clicks).most_common(1)[0]
-                if count >= 2:
+                if count >= 3:
                     is_stuck = True
 
-            # Also check for alternating patterns (e.g., tab/enter/tab/enter)
+            # Also check for alternating patterns (e.g., click A / click B / click A / click B)
             if not is_stuck and len(history) >= 4:
                 def extract_action_key(text: str) -> tuple:
                     m = re.search(r'\{[^{}]*\}', text)
@@ -226,7 +234,33 @@ class ClaudeClient:
                 if last4[0] == last4[2] and last4[1] == last4[3]:
                     is_stuck = True
 
+            # Also detect: no page change after 4+ actions (NEXT keeps failing)
+            if not is_stuck and len(history) >= 4:
+                recent_obs = []
+                for h in history[-4:]:
+                    obs_lower = h["assistant"].lower()
+                    if "observe:" in obs_lower:
+                        recent_obs.append(set(obs_lower.split("observe:")[1][:150].split()))
+                if len(recent_obs) >= 3:
+                    # If all recent observations share >60% words, page isn't changing
+                    pairs_similar = 0
+                    for i in range(len(recent_obs) - 1):
+                        overlap = len(recent_obs[i] & recent_obs[i+1]) / max(len(recent_obs[i] | recent_obs[i+1]), 1)
+                        if overlap > 0.6:
+                            pairs_similar += 1
+                    if pairs_similar >= 2:
+                        is_stuck = True
+
+            # Expose stuck state to caller
+            self.was_stuck = is_stuck
             if is_stuck:
+                # Capture context for learning
+                for h in reversed(history[-4:]):
+                    obs_lower = h["assistant"].lower()
+                    if "observe:" in obs_lower:
+                        self.stuck_context = obs_lower.split("observe:")[1][:200].strip()
+                        break
+
                 # Build a summary of what the AI has been doing
                 recent_actions = []
                 for h in history[-8:]:
@@ -243,33 +277,28 @@ class ClaudeClient:
                     for a in recent_actions[-4:]
                 )
 
-                # Count recent waits and clicks to give context-aware advice
+                # Analyze what the AI has been trying
                 recent_waits = sum(1 for a in recent_actions if a.get("type") == "wait")
-                recent_click_positions = set()
-                for a in recent_actions:
-                    if "click" in a.get("type", ""):
-                        recent_click_positions.add((a.get("x", 0) // 80, a.get("y", 0) // 80))
+                recent_click_count = sum(1 for a in recent_actions if "click" in a.get("type", ""))
+                recent_click_unique = len(set(
+                    (a.get("x", 0) // 60, a.get("y", 0) // 60)
+                    for a in recent_actions if "click" in a.get("type", "")
+                ))
 
-                # Check if the AI mentioned numbered elements in its observations
-                mentions_numbered = False
-                for h in history[-4:]:
-                    obs = h["assistant"].lower()
-                    if any(kw in obs for kw in ["hotspot", "numbered", "circle", "1-6", "1–6", "1-5", "1–5", "step 1", "step 2"]):
-                        mentions_numbered = True
-                        break
+                # If the AI has been clicking many DIFFERENT positions
+                # (e.g. clicking hotspots), it may be done and should try NEXT
+                clicking_varied_spots = recent_click_count >= 4 and recent_click_unique >= 3
 
-                if mentions_numbered:
+                if clicking_varied_spots:
                     stuck_warning = (
                         f"\n\nSYSTEM WARNING — YOU ARE IN A LOOP. "
                         f"Your recent actions: [{action_summary}].\n"
-                        f"You have identified NUMBERED INTERACTIVE ELEMENTS on this page "
-                        f"but have NOT clicked all of them. This is the blocker.\n"
-                        f"MANDATORY: Click each numbered element ONE BY ONE, starting "
-                        f"from number 1, then 2, then 3, etc. After clicking each one, "
-                        f"read/dismiss any popup that appears, then click the next number. "
-                        f"You must complete ALL of them before NEXT will work.\n"
-                        f"Do NOT wait, do NOT click NEXT, do NOT click sidebar items. "
-                        f"Click the numbered elements in order."
+                        f"You have been clicking multiple different elements on this page "
+                        f"but the page still hasn't advanced.\n"
+                        f"You may have ALREADY completed all the interactive content. "
+                        f"Try clicking NEXT now to advance. If NEXT doesn't work, "
+                        f"look for a 'Submit', 'Continue', or 'Close' button you missed, "
+                        f"or scroll down for hidden content."
                     )
                 elif recent_waits >= 2:
                     stuck_warning = (
@@ -278,30 +307,25 @@ class ClaudeClient:
                         f"You have already waited {recent_waits} times — waiting is NOT "
                         f"the solution. The page has interactive content that must be "
                         f"completed.\n"
-                        f"MANDATORY: Look carefully at the page content for:\n"
-                        f"  - Clickable items you haven't tried (tiles, hotspots, "
-                        f"buttons, numbered elements, tabs, expandable sections)\n"
-                        f"  - If you see numbered items (1, 2, 3...), click them ALL "
-                        f"in order starting from 1\n"
+                        f"MANDATORY: Look carefully at the page for:\n"
+                        f"  - Clickable items you haven't tried (numbered items, tiles, "
+                        f"hotspots, buttons, tabs, expandable sections)\n"
+                        f"  - If numbered items exist, click ALL of them in order\n"
                         f"  - Scroll down for hidden content\n"
-                        f"  - Check for unanswered questions\n"
-                        f"Do NOT wait again. Do NOT click sidebar items. "
-                        f"Do NOT repeat any previous action."
+                        f"Do NOT wait again. Do NOT repeat any previous action."
                     )
                 else:
                     stuck_warning = (
                         f"\n\nSYSTEM WARNING — YOU ARE IN A LOOP. "
                         f"Your recent actions: [{action_summary}].\n"
                         f"These actions are NOT making progress.\n"
-                        f"MANDATORY: Try these in order:\n"
-                        f"  1. WAIT — a video/animation may need to finish: "
+                        f"MANDATORY: Try something different:\n"
+                        f"  1. If there are numbered/interactive items on the page you "
+                        f"haven't clicked, click them ALL in order (1,2,3...)\n"
+                        f"  2. If you've already clicked all interactive items, try NEXT\n"
+                        f"  3. WAIT ONCE if a video/animation may be playing: "
                         f'use {{"type":"wait","duration":15}}\n'
-                        f"  2. Look for clickable content ON THE PAGE (not sidebar): "
-                        f"numbered items, tiles, hotspots, checkboxes, expand buttons. "
-                        f"If you see numbered items, click them ALL in order (1,2,3...)\n"
-                        f"  3. Scroll down for hidden content or controls\n"
-                        f"  4. Check if there's an unanswered question on the page\n"
-                        f"Do NOT click sidebar/menu items — the problem is on THIS page.\n"
+                        f"  4. Scroll down for hidden content or controls\n"
                         f"Do NOT repeat any action from your recent history."
                     )
 

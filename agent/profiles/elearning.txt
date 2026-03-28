@@ -23,6 +23,8 @@ NUMBERED CIRCLES / HOTSPOTS (CRITICAL — this is the #1 blocker):
     appeared in a panel or overlay — you may need to scroll within it
     or close it before the next number becomes clickable.
   - Do NOT skip numbers. Do NOT try NEXT before finishing all of them.
+  - AFTER completing ALL numbers, IMMEDIATELY click NEXT to advance.
+    Do NOT re-click numbers you already completed.
 
 WHEN NEXT BUTTON DOES NOT WORK — diagnose in this order:
   1. NUMBERED ELEMENTS: Are there numbered circles/hotspots on the slide
@@ -44,3 +46,5 @@ QUIZZES AND QUESTIONS:
   - Think about what the training material covered — match key terms.
   - If wrong and you can retry, the feedback often hints at the answer.
   - Watch for traps: "all of the above," absolutes like "never"/"always."
+
+LEARNED FROM EXPERIENCE:

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -23,6 +24,7 @@ from config import (
     SERIAL_PORT,
     list_profiles,
     load_profile,
+    add_lesson,
 )
 from screen import ScreenCapture
 from claude_client import ClaudeClient, ParseError
@@ -57,6 +59,8 @@ def _save_json(path: str, data) -> None:
 agent_lock = threading.Lock()
 agent_thread: threading.Thread | None = None
 agent_stop = threading.Event()
+guidance_queue: list[str] = []  # thread-safe via GIL for simple appends/reads
+guidance_lock = threading.Lock()
 
 screen: ScreenCapture | None = None
 hid: HIDPublisher | None = None
@@ -546,6 +550,9 @@ def agent_loop() -> None:
     history: list[dict] = []
     step = 0
     consecutive_screenshots = 0
+    prev_was_stuck = False
+    prev_stuck_context = ""
+    prev_observe = ""
 
     while not agent_stop.is_set():
         step += 1
@@ -558,6 +565,25 @@ def agent_loop() -> None:
         def on_token(token: str) -> None:
             socketio.emit("thinking_token", {"token": token})
 
+        # Drain any live guidance from the user
+        pending_guidance: list[str] = []
+        with guidance_lock:
+            if guidance_queue:
+                pending_guidance = guidance_queue.copy()
+                guidance_queue.clear()
+
+        # Inject guidance into history so the AI sees it
+        if pending_guidance:
+            guidance_text = "\n".join(f"- {g}" for g in pending_guidance)
+            history.append({
+                "user": (
+                    f"USER GUIDANCE (follow these instructions from the human operator):\n"
+                    f"{guidance_text}\n"
+                    f"Acknowledge the guidance briefly in your THINK step, then act on it."
+                ),
+                "assistant": "Understood, I will follow the operator's guidance.",
+            })
+
         step_start = time.time()
         try:
             img = screen.grab()
@@ -566,7 +592,6 @@ def agent_loop() -> None:
         except ParseError as e:
             socketio.emit("thinking_end", {})
             socketio.emit("log", {"text": f"[ParseError] {e} — retaking screenshot and retrying…"})
-            # Don't crash — the AI likely ran out of tokens. Retry once.
             continue
         except Exception as e:
             socketio.emit("thinking_end", {})
@@ -590,6 +615,105 @@ def agent_loop() -> None:
             "user": f"Step {step}. Screenshot attached. Decide next action.",
             "assistant": reasoning,
         })
+
+        # --- Profile learning: detect mistakes and save lessons ---
+        if active_profile:
+            # Extract current OBSERVE text
+            cur_observe = ""
+            reasoning_lower = reasoning.lower()
+            if "observe:" in reasoning_lower:
+                cur_observe = reasoning_lower.split("observe:")[1][:200].strip()
+
+            def _save_lesson(lesson: str) -> None:
+                if add_lesson(active_profile, lesson):
+                    socketio.emit("log", {"text": f"[Learn] Saved: {lesson}"})
+                    claude.set_profile(load_profile(active_profile))
+
+            def _describe_action(a_type: str, a: dict) -> str:
+                if "click" in a_type:
+                    return f"click at ({a.get('x','?')},{a.get('y','?')})"
+                if a_type == "wait":
+                    return f"wait {a.get('duration','')}s"
+                if a_type == "key":
+                    return f"key {a.get('keys','')}"
+                return a_type
+
+            # 1) Stuck→recovery: was stuck, then page changed
+            if prev_was_stuck and cur_observe and prev_observe:
+                cur_words = set(cur_observe.split())
+                prev_words = set(prev_observe.split())
+                if prev_words and cur_words:
+                    overlap = len(cur_words & prev_words) / max(len(cur_words | prev_words), 1)
+                    if overlap < 0.5:
+                        context_short = prev_stuck_context[:80].strip()
+                        _save_lesson(
+                            f"Stuck on '{context_short}' — resolved by: "
+                            f"{_describe_action(action_type, action)}"
+                        )
+
+            # 2) Page unchanged after action: AI tried something that didn't work
+            #    If same OBSERVE 3 turns in a row, learn what's NOT working
+            if len(history) >= 3 and cur_observe and prev_observe:
+                cur_words = set(cur_observe.split())
+                prev_words = set(prev_observe.split())
+                if cur_words and prev_words:
+                    same_page = (
+                        len(cur_words & prev_words) / max(len(cur_words | prev_words), 1) > 0.6
+                    )
+                    if same_page:
+                        # Check the action from 2 steps ago too
+                        two_ago_obs = ""
+                        if len(history) >= 3:
+                            two_ago = history[-3]["assistant"].lower()
+                            if "observe:" in two_ago:
+                                two_ago_obs = two_ago.split("observe:")[1][:200].strip()
+                        two_ago_words = set(two_ago_obs.split()) if two_ago_obs else set()
+                        three_same = (
+                            two_ago_words and cur_words
+                            and len(cur_words & two_ago_words) / max(len(cur_words | two_ago_words), 1) > 0.6
+                        )
+                        if three_same:
+                            # 3 turns on same page — extract what failed
+                            failed_actions = []
+                            for h in history[-3:-1]:
+                                m = re.search(r'\{[^{}]*\}', h["assistant"])
+                                if m:
+                                    try:
+                                        a = json.loads(m.group(0))
+                                        failed_actions.append(
+                                            _describe_action(a.get("type", ""), a)
+                                        )
+                                    except json.JSONDecodeError:
+                                        pass
+                            if failed_actions:
+                                page_short = cur_observe[:60].strip()
+                                _save_lesson(
+                                    f"On '{page_short}': "
+                                    f"{', '.join(failed_actions)} did NOT advance the page"
+                                )
+
+            # 3) Backward navigation: current page matches something from 5+ steps ago
+            if len(history) >= 6 and cur_observe:
+                cur_words = set(cur_observe.split())
+                if len(cur_words) > 4:
+                    for h in history[:-5]:
+                        old_lower = h["assistant"].lower()
+                        if "observe:" in old_lower:
+                            old_obs = old_lower.split("observe:")[1][:200].strip()
+                            old_words = set(old_obs.split())
+                            if len(old_words) > 4:
+                                overlap = len(cur_words & old_words) / min(len(cur_words), len(old_words))
+                                if overlap > 0.6:
+                                    _save_lesson(
+                                        f"Went backward to '{cur_observe[:60]}' "
+                                        f"— avoid clicking sidebar/menu for earlier sections"
+                                    )
+                                    break
+
+            # Track for next iteration
+            prev_was_stuck = claude.was_stuck
+            prev_stuck_context = claude.stuck_context
+            prev_observe = cur_observe
 
         if action_type == "done":
             msg = action.get("message", "")
@@ -683,15 +807,19 @@ def on_start_task(data):
         socketio.emit("log", {"text": "[Error] No task provided."})
         return
 
+    # If already running, stop the current task first and wait for it to finish
     if agent_thread and agent_thread.is_alive():
-        socketio.emit("log", {"text": "[Agent] Already running. Stop first."})
-        return
+        socketio.emit("log", {"text": "[Agent] Stopping current task for new one…"})
+        agent_stop.set()
+        agent_thread.join(timeout=5)
 
     current_task = task
-    claude.reset()  # clear previous conversation state
+    claude.reset()
     agent_stop.clear()
+    with guidance_lock:
+        guidance_queue.clear()
 
-    socketio.emit("log", {"text": f"[Agent] Starting task: {task}"})
+    socketio.emit("log", {"text": f"\n[Agent] Starting task: {task}"})
     socketio.emit("status", {"running": True})
 
     agent_thread = threading.Thread(target=agent_loop, daemon=True)
@@ -703,6 +831,21 @@ def on_stop_task():
     agent_stop.set()
     socketio.emit("log", {"text": "[Agent] Stop requested."})
     socketio.emit("status", {"running": False})
+
+
+@socketio.on("send_guidance")
+def on_send_guidance(data):
+    """Live guidance from user while agent is running."""
+    msg = data.get("message", "").strip()
+    if not msg:
+        return
+    with guidance_lock:
+        guidance_queue.append(msg)
+    socketio.emit("log", {"text": f"[You] {msg}"})
+    # Also save as a lesson if a profile is active
+    if active_profile:
+        add_lesson(active_profile, f"User guidance: {msg}")
+        socketio.emit("log", {"text": f"[Learn] Saved guidance as lesson"})
 
 
 @socketio.on("set_prompt_rate")
