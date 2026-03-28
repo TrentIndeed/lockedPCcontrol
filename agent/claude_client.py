@@ -1,39 +1,31 @@
-"""Claude client — talks to a local OpenAI-compatible proxy at 127.0.0.1:10531."""
+"""AI client — talks to OpenAI-compatible proxy via the Responses API."""
 
 import json
 import re
+import urllib.error
+import urllib.request
+from typing import Callable, Optional
 
-from openai import OpenAI
+from config import MAX_OUTPUT_TOKENS, SYSTEM_PROMPT as _CONFIG_PROMPT
 
-SYSTEM_PROMPT = """\
-You are an AI agent controlling a remote PC through physical HID input.
-The screen is {w}x{h} pixels. You see a screenshot each turn.
+# Fallback prompt if system_prompt.txt doesn't exist and config has no prompt
+_DEFAULT_PROMPT = """\
+You are an AI agent controlling a remote Windows PC through physical HID input.
+The screen is {w}x{h} pixels. You see a fresh screenshot each turn.
 
-You control the mouse and keyboard via JSON actions. Mouse movement is
-RELATIVE (dx/dy deltas from current position). You cannot jump to absolute
-coordinates — move incrementally and take screenshots to verify position.
+Available actions (reply with ONE raw JSON object):
 
-Available actions (reply with exactly ONE raw JSON object, nothing else):
-
-  {{"type":"move","dx":<int>,"dy":<int>}}
-  {{"type":"click","button":"left"}}
-  {{"type":"right_click","button":"right"}}
-  {{"type":"double_click","button":"left"}}
-  {{"type":"scroll","dx":0,"dy":<int>}}       (negative = scroll down)
+  {{"type":"click_at","x":<int>,"y":<int>}}
+  {{"type":"double_click_at","x":<int>,"y":<int>}}
+  {{"type":"right_click_at","x":<int>,"y":<int>}}
+  {{"type":"scroll_at","x":<int>,"y":<int>,"dy":<int>}}
   {{"type":"key","keys":["ctrl","c"]}}
   {{"type":"type","text":"hello world"}}
-  {{"type":"screenshot"}}                     (no-op; just get a fresh screenshot)
+  {{"type":"screenshot"}}
+  {{"type":"wait","duration":<seconds>}}
   {{"type":"done","message":"<reason>"}}
 
-Rules:
-- Reply with RAW JSON only. No markdown, no explanation, no extra text.
-- One action per turn.
-- If the task is complete, reply with the "done" action.
-- If you need to see the screen again without acting, use "screenshot".
-- For key combos: list modifier keys first, then the main key.
-  Supported keys: ctrl, alt, shift, win, tab, enter, escape, backspace,
-  delete, up, down, left, right, f1-f12, home, end, pageup, pagedown, space,
-  plus any single printable character.
+One action per turn. Specify pixel coordinates of the CENTER of the target element.
 """
 
 
@@ -49,9 +41,12 @@ class ClaudeClient:
         screen_w: int = 1280,
         screen_h: int = 720,
     ) -> None:
-        self._client = OpenAI(base_url=base_url, api_key="not-needed")
+        self._base_url = base_url.rstrip("/")
         self._model = model
-        self._system = SYSTEM_PROMPT.format(w=screen_w, h=screen_h)
+        self._screen_w = screen_w
+        self._screen_h = screen_h
+        prompt = _CONFIG_PROMPT or _DEFAULT_PROMPT
+        self._system = prompt.format(w=screen_w, h=screen_h)
 
         # cost tracking
         self.total_input_tokens: int = 0
@@ -59,26 +54,79 @@ class ClaudeClient:
 
     # -- public API ----------------------------------------------------------
 
-    def decide(self, task: str, screenshot_b64: str, history: list[dict]) -> dict:
-        messages = self._build_messages(task, screenshot_b64, history)
-        response = self._client.chat.completions.create(
-            model=self._model,
-            max_tokens=256,
-            messages=messages,
+    def decide(
+        self,
+        task: str,
+        screenshot_b64: str,
+        history: list[dict],
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        input_msgs = self._build_input(task, screenshot_b64, history)
+
+        payload = json.dumps({
+            "model": self._model,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "instructions": self._system,
+            "input": input_msgs,
+            "stream": True,
+        })
+
+        req = urllib.request.Request(
+            f"{self._base_url}/responses",
+            data=payload.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
 
-        # accumulate token usage
-        if response.usage:
-            self.total_input_tokens += response.usage.prompt_tokens
-            self.total_output_tokens += response.usage.completion_tokens
+        try:
+            resp = urllib.request.urlopen(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            raise ParseError(f"API {e.code}: {error_body[:500]}") from e
+
+        full_text = ""
+        usage_data = {}
+
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            chunk = line[6:]
+            if chunk == "[DONE]":
+                break
+            try:
+                d = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+
+            etype = d.get("type", "")
+
+            if etype == "response.output_text.delta":
+                delta = d.get("delta", "")
+                full_text += delta
+                if on_token:
+                    on_token(delta)
+
+            elif etype == "response.completed":
+                r = d.get("response", {})
+                usage_data = r.get("usage", {})
+
+        # update cost (gpt-5.4 pricing estimate)
+        self.total_input_tokens += usage_data.get("input_tokens", 0)
+        self.total_output_tokens += usage_data.get("output_tokens", 0)
         self._print_cost()
 
-        raw_text = response.choices[0].message.content
-        return self._parse_response(raw_text)
+        if not full_text.strip():
+            raise ParseError("Empty response from AI")
+
+        action = self._parse_response(full_text)
+        # Store reasoning text on the action so the caller can log/save it
+        action["_reasoning"] = full_text.strip()
+        return action
 
     def get_cost(self) -> dict[str, float]:
-        input_cost = (self.total_input_tokens / 1_000_000) * 3.00
-        output_cost = (self.total_output_tokens / 1_000_000) * 15.00
+        input_cost = (self.total_input_tokens / 1_000_000) * 2.50
+        output_cost = (self.total_output_tokens / 1_000_000) * 10.00
         return {
             "input_tokens": self.total_input_tokens,
             "output_tokens": self.total_output_tokens,
@@ -86,6 +134,10 @@ class ClaudeClient:
             "output_cost": output_cost,
             "total_cost": input_cost + output_cost,
         }
+
+    def reset(self) -> None:
+        """No-op for compatibility."""
+        pass
 
     # -- internals -----------------------------------------------------------
 
@@ -96,49 +148,95 @@ class ClaudeClient:
             f"session=${c['total_cost']:.4f}"
         )
 
-    def _build_messages(
-        self, task: str, screenshot_b64: str, history: list[dict]
+    @staticmethod
+    def _build_input(
+        task: str, screenshot_b64: str, history: list[dict],
     ) -> list[dict]:
-        messages: list[dict] = [
-            {"role": "system", "content": self._system},
-        ]
+        messages: list[dict] = []
 
         # rolling history (text only, no images)
         for entry in history[-10:]:
-            messages.append({"role": "user", "content": entry["user"]})
-            messages.append({"role": "assistant", "content": entry["assistant"]})
-
-        # current turn: screenshot + task reminder
-        messages.append(
-            {
+            messages.append({
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{screenshot_b64}",
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": f"Task: {task}\nDecide the next single action.",
-                    },
-                ],
-            }
+                "content": [{"type": "input_text", "text": entry["user"]}],
+            })
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": entry["assistant"]}],
+            })
+
+        # stuck detection — fuzzy: same action type + nearby coordinates
+        stuck_warning = ""
+        if len(history) >= 3:
+            def extract_action_key(text: str) -> tuple:
+                """Return (type, x_bucket, y_bucket) for fuzzy comparison."""
+                m = re.search(r'\{[^{}]*\}', text)
+                if not m:
+                    return (text,)
+                try:
+                    obj = json.loads(m.group(0))
+                except json.JSONDecodeError:
+                    return (m.group(0),)
+                atype = obj.get("type", "")
+                # bucket coordinates to nearest 30px so slight variations match
+                x = obj.get("x", -999)
+                y = obj.get("y", -999)
+                return (atype, x // 30, y // 30)
+
+            last_keys = [extract_action_key(h["assistant"]) for h in history[-3:]]
+            # Also check for alternating patterns (e.g., tab/enter/tab/enter)
+            is_stuck = len(set(last_keys)) == 1
+            if not is_stuck and len(history) >= 4:
+                last4 = [extract_action_key(h["assistant"]) for h in history[-4:]]
+                # A-B-A-B pattern: positions 0,2 match AND positions 1,3 match
+                if last4[0] == last4[2] and last4[1] == last4[3]:
+                    is_stuck = True
+            if is_stuck:
+                stuck_warning = (
+                    "\n\nWARNING: You repeated the same action 3+ times with no "
+                    "effect. Try a COMPLETELY DIFFERENT approach:\n"
+                    "  - Click 20-30px INWARD from the screen edge\n"
+                    "  - Scroll the page so the button moves away from the edge\n"
+                    "  - Use arrow keys (right/left) to navigate controls\n"
+                    "  - Look for an alternative path to the same goal\n"
+                    "Do NOT use Tab (it triggers skip-navigation overlays).\n"
+                    "Do NOT repeat the same action again."
+                )
+
+        # current turn: screenshot + task
+        prompt = (
+            f"Task: {task}\n\n"
+            f"Step {len(history) + 1}. Look at the screenshot. "
+            f"Follow the OBSERVE/THINK/PLAN format, then output your JSON action."
+            f"{stuck_warning}"
         )
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{screenshot_b64}",
+                },
+                {
+                    "type": "input_text",
+                    "text": prompt,
+                },
+            ],
+        })
         return messages
 
     @staticmethod
     def _parse_response(text: str) -> dict:
         cleaned = text.strip()
-        # strip accidental markdown fences
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        cleaned = cleaned.strip()
+        json_match = re.search(r'\{[^{}]*\}', cleaned)
+        if not json_match:
+            raise ParseError(f"No JSON found in AI response: {text!r}")
+
+        json_str = json_match.group(0)
         try:
-            action = json.loads(cleaned)
+            action = json.loads(json_str)
         except json.JSONDecodeError as exc:
-            raise ParseError(f"Invalid JSON from Claude: {text!r}") from exc
+            raise ParseError(f"Invalid JSON from AI: {json_str!r}") from exc
         if "type" not in action:
             raise ParseError(f"Missing 'type' key in action: {action}")
         return action

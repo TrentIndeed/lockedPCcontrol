@@ -1,0 +1,47 @@
+# ============================================================================
+# Agent Configuration
+# ============================================================================
+# Copy this file to agent.local.yaml to override without touching git history.
+# Environment variables override both files (e.g. API_BASE_URL=...).
+
+# --- AI Model ---------------------------------------------------------------
+api_base_url: "http://127.0.0.1:10531/v1"   # OpenAI-compatible endpoint
+model: "gpt-5.4"
+max_output_tokens: 2048                       # tokens per AI response
+max_steps: 200                                # max actions per task
+
+# --- Hardware ----------------------------------------------------------------
+serial_port: "COM5"
+serial_baud: 115200
+capture_device_id: 1
+
+# --- Screen ------------------------------------------------------------------
+# Image size sent to the AI (capture card output is resized to this)
+screen_width: 1280
+screen_height: 720
+
+# --- Mouse Scale -------------------------------------------------------------
+# Mickeys per image pixel. Controls how far the physical cursor moves.
+# Depends on the locked PC's pointer speed setting and whether acceleration is on.
+#
+# To calibrate: run `python test_accel_and_click.py --live` and adjust until
+# clicks land accurately. Higher = cursor moves further per image pixel.
+#
+# Common values:
+#   0.79  — pointer speed ~13/20, acceleration OFF (Trenton's setup)
+#   1.50  — pointer speed 10/20 (Windows default), acceleration OFF
+#   0.37  — pointer speed ~13/20, acceleration ON
+mickey_scale_x: 0.79
+mickey_scale_y: 0.79
+
+# --- Timing ------------------------------------------------------------------
+prompt_rate: 5.0    # minimum seconds between AI prompts (includes thinking time)
+
+# --- System Prompt -----------------------------------------------------------
+# The AI's base instructions. Loaded from this file's system_prompt field,
+# or from system_prompt.txt if that file exists (takes priority).
+# Use {w} and {h} for screen dimensions.
+#
+# The prompt below is generic — it works for any task (training courses,
+# web browsing, desktop apps, etc). Edit it or system_prompt.txt to
+# specialize for your use case.

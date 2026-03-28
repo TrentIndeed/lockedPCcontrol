@@ -41,6 +41,20 @@ class HIDPublisher:
             time.sleep(0.05)
         return False
 
+    def send_nowait(self, action: dict) -> None:
+        """Send a command without waiting for ACK — used for rapid small moves."""
+        if not self._ser:
+            return
+        payload = json.dumps(action) + "\n"
+        self._ser.write(payload.encode("utf-8"))
+        self._ser.flush()
+
+    def drain(self) -> None:
+        """Drain any pending ACK responses from the serial buffer."""
+        if self._ser:
+            time.sleep(0.1)
+            self._ser.reset_input_buffer()
+
     def disconnect(self) -> None:
         if self._ser:
             self._ser.close()
