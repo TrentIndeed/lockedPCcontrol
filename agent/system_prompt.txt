@@ -59,3 +59,15 @@ STRATEGY:
 - If the same click fails 3+ times, do NOT keep trying slight coordinate variations.
   Try a COMPLETELY different approach — scroll, use arrow keys, or interact with
   a different element that might achieve the same goal.
+
+QUIZ / TEST STRATEGY:
+- When you see a quiz question, STOP and read it carefully before answering.
+- Read ALL answer choices completely before selecting one.
+- Think about what the training material covered — the correct answer usually
+  matches key terms or concepts from the slides you just viewed.
+- If you are unsure, use {{"type":"screenshot"}} to get a fresh, clear view
+  of the question and all choices before committing to an answer.
+- Look for keywords: "all of the above," "none of the above," or absolute
+  words like "never" / "always" which are often wrong.
+- If your first answer was wrong and you get to retry, carefully re-read the
+  question — the feedback often hints at the correct answer.

@@ -305,31 +305,59 @@ def _home_cursor() -> None:
 
 
 def move_cursor_to(x: int, y: int) -> None:
-    """Move cursor to absolute (x, y) via home-then-move.
+    """Move cursor to absolute (x, y).
 
-    Sends multiple fixed-size chunks (CHUNK_SIZE mickeys each) to keep
-    Windows acceleration consistent per chunk, making total movement linear.
+    Uses relative move from current tracked position when the delta is small
+    (< 400px). For larger moves or when position is uncertain, homes first.
+    This avoids the cursor visibly flying to the top-left corner every action.
     """
     global cursor_x, cursor_y
 
     x = max(0, min(SCREEN_WIDTH, x))
     y = max(0, min(SCREEN_HEIGHT, y))
 
-    _home_cursor()
+    dx_px = x - cursor_x
+    dy_px = y - cursor_y
 
-    target_mx = int(x * MICKEY_SCALE_X)
-    target_my = int(y * MICKEY_SCALE_Y)
+    # Use relative move if delta is small — avoids visible home-then-move
+    if abs(dx_px) < 400 and abs(dy_px) < 400 and (cursor_x != 0 or cursor_y != 0):
+        dx_m = int(dx_px * MICKEY_SCALE_X)
+        dy_m = int(dy_px * MICKEY_SCALE_Y)
+        hid.send({"type": "move", "dx": dx_m, "dy": dy_m})
+        time.sleep(0.15)
+    else:
+        # Large move or unknown position — home first for accuracy
+        _home_cursor()
+        target_mx = int(x * MICKEY_SCALE_X)
+        target_my = int(y * MICKEY_SCALE_Y)
+        hid.send({"type": "move", "dx": target_mx, "dy": target_my})
+        time.sleep(0.2)
 
-    # Send as single command — ESP32 chunks at ±127 internally with 5ms delay.
-    # The consistent chunk speed means acceleration is a constant multiplier.
-    hid.send({"type": "move", "dx": target_mx, "dy": target_my})
-    time.sleep(0.2)
     cursor_x = x
     cursor_y = y
 
 
-_EDGE_MARGIN = 50   # pixels from edge considered "near edge"
-_EDGE_NUDGE = 8     # pixels to nudge inward for edge clicks
+_EDGE_MARGIN = 60   # pixels from edge considered "near edge"
+_EDGE_NUDGE_BASE = 10  # base pixels to nudge inward for edge clicks
+_EDGE_NUDGE_MAX = 30   # max nudge after repeated misses
+
+# Track recent click locations to detect retries near the same spot
+_recent_clicks: list[tuple[int, int]] = []
+
+
+def _edge_nudge_amount() -> int:
+    """Increase nudge if recent clicks cluster near the same edge spot."""
+    if len(_recent_clicks) < 2:
+        return _EDGE_NUDGE_BASE
+    # Count how many of the last 4 clicks are within 40px of the most recent
+    lx, ly = _recent_clicks[-1]
+    nearby = sum(
+        1 for x, y in _recent_clicks[-4:]
+        if abs(x - lx) < 40 and abs(y - ly) < 40
+    )
+    # Scale nudge: 1 nearby=base, 2=base*1.5, 3+=base*2 up to max
+    multiplier = min(1.0 + (nearby - 1) * 0.5, _EDGE_NUDGE_MAX / _EDGE_NUDGE_BASE)
+    return min(int(_EDGE_NUDGE_BASE * multiplier), _EDGE_NUDGE_MAX)
 
 
 def execute_action(action: dict) -> bool:
@@ -340,24 +368,30 @@ def execute_action(action: dict) -> bool:
         target_x = action.get("x", SCREEN_WIDTH // 2)
         target_y = action.get("y", SCREEN_HEIGHT // 2)
 
+        # Track raw click location for adaptive nudge
+        _recent_clicks.append((target_x, target_y))
+        if len(_recent_clicks) > 10:
+            _recent_clicks.pop(0)
+
         # Nudge clicks near screen edges inward — cursor positioning is less
         # accurate at extremes due to boundary clamping and rounding errors
+        nudge = _edge_nudge_amount()
         nudged = False
         if target_x > SCREEN_WIDTH - _EDGE_MARGIN:
-            target_x -= _EDGE_NUDGE
+            target_x -= nudge
             nudged = True
         elif target_x < _EDGE_MARGIN:
-            target_x += _EDGE_NUDGE
+            target_x += nudge
             nudged = True
         if target_y > SCREEN_HEIGHT - _EDGE_MARGIN:
-            target_y -= _EDGE_NUDGE
+            target_y -= nudge
             nudged = True
         elif target_y < _EDGE_MARGIN:
-            target_y += _EDGE_NUDGE
+            target_y += nudge
             nudged = True
 
         if nudged:
-            socketio.emit("log", {"text": f"[Move] Edge nudge -> ({target_x}, {target_y})"})
+            socketio.emit("log", {"text": f"[Move] Edge nudge {nudge}px -> ({target_x}, {target_y})"})
 
         socketio.emit("log", {"text": f"[Move] Positioning cursor at ({target_x}, {target_y})…"})
         move_cursor_to(target_x, target_y)
@@ -406,6 +440,7 @@ def agent_loop() -> None:
         return
 
     socketio.emit("log", {"text": f"[Config] MICKEY_SCALE X={MICKEY_SCALE_X:.3f} Y={MICKEY_SCALE_Y:.3f}"})
+    _recent_clicks.clear()
     _home_cursor()  # start from known position
 
     # record task
