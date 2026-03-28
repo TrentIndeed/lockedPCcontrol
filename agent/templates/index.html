@@ -170,7 +170,13 @@
             <label style="margin-left:8px">Scale:</label>
             <button id="btnScaleDown" style="background:#444;border:none;color:#aaa;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer">-</button>
             <button id="btnScaleUp" style="background:#444;border:none;color:#aaa;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer">+</button>
+            <span id="scaleDisplay" style="color:#888;font-family:monospace;font-size:11px;min-width:60px"></span>
+            <label style="margin-left:8px">Profile:</label>
+            <select id="profileSelect" style="background:#222;border:1px solid #444;color:#fff;padding:4px 8px;border-radius:4px;font-size:12px">
+                <option value="">none (generic)</option>
+            </select>
             <button id="btnCalibrate" style="background:#ff9800;border:none;color:#fff;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;margin-left:8px">Calibrate</button>
+            <button id="btnClickTest" style="background:#2196f3;border:none;color:#fff;padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;margin-left:4px" title="Click center of screen to test accuracy">Test Click</button>
         </div>
     </header>
 
@@ -310,16 +316,7 @@
             thinkingDiv = null;
         });
 
-        // --- log messages ---
-        socket.on('log', (data) => {
-            let cls = '';
-            if (data.text.includes('[Agent]')) cls = 'agent';
-            else if (data.text.includes('[Action]')) cls = 'action';
-            else if (data.text.includes('[Error]')) cls = 'error';
-            else if (data.text.includes('[Cost]')) cls = 'cost-line';
-            else if (data.text.includes('[Memory]')) cls = 'user-msg';
-            appendLog(data.text, cls);
-        });
+        // --- log messages --- (handled below with scale display)
 
         socket.on('cost', (data) => {
             costDisplay.textContent = '$' + data.total_cost.toFixed(4);
@@ -331,10 +328,6 @@
             btnSend.disabled = running;
             btnStop.disabled = !running;
             taskInput.disabled = running;
-        });
-
-        socket.on('settings', (data) => {
-            promptRate.value = data.prompt_rate;
         });
 
         socket.on('task_log', (data) => {
@@ -406,6 +399,46 @@
         });
         document.getElementById('btnCalibrate').addEventListener('click', () => {
             socket.emit('calibrate');
+        });
+        document.getElementById('btnClickTest').addEventListener('click', () => {
+            // Click center of screen to test accuracy
+            socket.emit('click_test', { x: 640, y: 360 });
+        });
+
+        // --- profile selector ---
+        const profileSelect = document.getElementById('profileSelect');
+        profileSelect.addEventListener('change', () => {
+            socket.emit('set_profile', { profile: profileSelect.value });
+        });
+        socket.on('profile', (data) => {
+            profileSelect.innerHTML = '<option value="">none (generic)</option>';
+            (data.profiles || []).forEach(p => {
+                const opt = document.createElement('option');
+                opt.value = p;
+                opt.textContent = p;
+                profileSelect.appendChild(opt);
+            });
+            profileSelect.value = data.active || '';
+        });
+
+        // Update scale display when settings arrive
+        socket.on('settings', (data) => {
+            promptRate.value = data.prompt_rate;
+        });
+
+        socket.on('log', (data) => {
+            // Update scale display from config log messages
+            const scaleMatch = data.text.match(/MICKEY_SCALE X=([\d.]+) Y=([\d.]+)/);
+            if (scaleMatch) {
+                document.getElementById('scaleDisplay').textContent = scaleMatch[1];
+            }
+            let cls = '';
+            if (data.text.includes('[Agent]')) cls = 'agent';
+            else if (data.text.includes('[Action]')) cls = 'action';
+            else if (data.text.includes('[Error]') || data.text.includes('ERROR')) cls = 'error';
+            else if (data.text.includes('[Cost]')) cls = 'cost-line';
+            else if (data.text.includes('[Memory]')) cls = 'user-msg';
+            appendLog(data.text, cls);
         });
     </script>
 </body>

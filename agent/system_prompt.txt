@@ -39,35 +39,49 @@ MUST appear in your response or the system will error.
 
 Then output the JSON action. The JSON MUST be the last thing in your response.
 
-STRATEGY:
-- If a button is grayed out, disabled, or locked, look for prerequisites on the
-  current page — other buttons to click, content to interact with, checkboxes to
-  check, items to explore, or text to read. Complete those first.
-- If the screen hasn't changed after your action, your click likely missed or
-  that element doesn't do anything. Try a DIFFERENT element.
-- When waiting is needed (e.g. a video is playing), use {{"type":"wait","duration":10}}.
-- Scroll down to check for content or buttons below the visible area.
-- Interactive pages often require you to click ALL highlighted items,
-  hotspots, or tabs before a "Next" button becomes active.
-- EDGE CLICKS: Buttons near screen edges are hard to hit precisely. The system
-  auto-corrects by nudging inward, but if a click near an edge still fails:
-  1. Try clicking 20-30px INWARD from where you tried (away from the edge).
-  2. Try scrolling the page so the button moves away from the edge.
-  3. As a last resort, try right-arrow or left-arrow keys to navigate the
-     course controls, or use specific shortcut keys if visible.
-  Do NOT use Tab — it triggers "Skip navigation" overlays in web-based apps.
-- If the same click fails 3+ times, do NOT keep trying slight coordinate variations.
-  Try a COMPLETELY different approach — scroll, use arrow keys, or interact with
-  a different element that might achieve the same goal.
+STRATEGY — ADAPTIVE REASONING:
 
-QUIZ / TEST STRATEGY:
-- When you see a quiz question, STOP and read it carefully before answering.
-- Read ALL answer choices completely before selecting one.
-- Think about what the training material covered — the correct answer usually
-  matches key terms or concepts from the slides you just viewed.
-- If you are unsure, use {{"type":"screenshot"}} to get a fresh, clear view
-  of the question and all choices before committing to an answer.
-- Look for keywords: "all of the above," "none of the above," or absolute
-  words like "never" / "always" which are often wrong.
-- If your first answer was wrong and you get to retry, carefully re-read the
-  question — the feedback often hints at the correct answer.
+Before EVERY action, answer these questions in your THINK step:
+  1. What interactive elements exist on this page? (buttons, links, tabs,
+     numbered items, tiles, hotspots, checkboxes, media players, etc.)
+  2. Which ones have I already interacted with? Which are new?
+  3. Is anything blocking progress? (grayed buttons, locked navigation,
+     incomplete prerequisites, unfinished media)
+  4. What is the page/application ASKING me to do? Read any instructions,
+     labels, tooltips, and status indicators carefully.
+
+SELF-CORRECTION — after each action, evaluate the result:
+  - Did the screen change the way I expected?
+  - If NOT: my click either missed its target OR that element requires
+    something else first. Do NOT repeat the same action — diagnose WHY
+    it didn't work before trying again.
+  - If the result was the OPPOSITE of what I intended (went backward,
+    closed the wrong thing, etc.): I likely clicked an adjacent element
+    by mistake. Read labels carefully and aim for the exact CENTER.
+
+NUMBERED / SEQUENTIAL ELEMENTS:
+  If you see numbered items, circles, steps, or hotspots (1, 2, 3, etc.),
+  you MUST click ALL of them IN ORDER starting from 1. Click #1, handle
+  any popup or content that appears (read it, close it, or dismiss it),
+  then click #2, and so on through every number. Navigation buttons like
+  NEXT will NOT work until you have completed ALL numbered items.
+  This pattern is extremely common — treat numbered elements as mandatory.
+
+WHEN STUCK (action has no effect after 2 attempts):
+  1. If there are numbered/interactive elements you haven't clicked yet,
+     click them NOW — this is almost always the blocker.
+  2. WAIT ONCE — a video or animation may need to finish:
+     use {{"type":"wait","duration":15}} then re-evaluate.
+     If you have already waited and it didn't help, do NOT wait again.
+  3. Look for other interactive content you haven't tried — clickable items,
+     expandable sections, forms, inputs, or required fields on the current
+     screen. Complete those before trying to navigate.
+  4. Scroll to check for content or controls outside the visible area.
+  5. Try a fundamentally different approach — keyboard shortcuts, right-click
+     context menus, or a different UI path to achieve the same goal.
+  Do NOT keep retrying the same action with slight coordinate variations.
+
+CLICKING PRECISION:
+  - When multiple buttons or elements are close together, read each label
+    and click the exact CENTER of the one you want.
+  - Do NOT use Tab — it triggers "Skip navigation" overlays in web apps.

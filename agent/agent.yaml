@@ -5,10 +5,12 @@
 # Environment variables override both files (e.g. API_BASE_URL=...).
 
 # --- AI Model ---------------------------------------------------------------
-api_base_url: "http://127.0.0.1:10531/v1"   # OpenAI-compatible endpoint
-model: "gpt-5.4"
+# api_base_url and model are loaded from .env (API_BASE_URL, MODEL)
+# Uncomment to override:
+# api_base_url: "http://your-endpoint/v1"
+# model: "your-model"
 max_output_tokens: 2048                       # tokens per AI response
-max_steps: 200                                # max actions per task
+max_steps: 1000                                # max actions per task
 
 # --- Hardware ----------------------------------------------------------------
 serial_port: "COM5"

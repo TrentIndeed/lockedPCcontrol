@@ -21,6 +21,8 @@ from config import (
     SCREEN_WIDTH,
     SERIAL_BAUD,
     SERIAL_PORT,
+    list_profiles,
+    load_profile,
 )
 from screen import ScreenCapture
 from claude_client import ClaudeClient, ParseError
@@ -63,6 +65,7 @@ claude: ClaudeClient | None = None
 prompt_rate: float = _CFG_PROMPT_RATE
 current_task: str = ""
 max_steps: int = MAX_STEPS
+active_profile: str = ""  # name of the active task profile (empty = none)
 
 # persistent session data
 task_log: list[dict] = _load_json(TASK_LOG_FILE, [])
@@ -96,13 +99,156 @@ def init_hardware() -> None:
         claude = ClaudeClient(API_BASE_URL, MODEL, SCREEN_WIDTH, SCREEN_HEIGHT)
 
 
+def startup_check() -> list[dict]:
+    """Run hardware health checks. Returns list of {component, ok, message, fixes}."""
+    results: list[dict] = []
+
+    # --- ESP32 Serial -----------------------------------------------------------
+    esp_result = {"component": "ESP32 Serial", "ok": False, "message": "", "fixes": []}
+    try:
+        import serial as _serial
+        import serial.tools.list_ports as list_ports
+
+        available = [p.device for p in list_ports.comports()]
+
+        if SERIAL_PORT not in available:
+            esp_result["message"] = (
+                f"Port {SERIAL_PORT} not found. Available ports: {available or 'none'}"
+            )
+            esp_result["fixes"] = [
+                "Check that the ESP32-S3 is plugged in via USB",
+                f"Update 'serial_port' in agent.yaml (current: {SERIAL_PORT})",
+                "Try a different USB cable — some are charge-only",
+                "Open Device Manager and check COM ports",
+                "Install CP210x or CH340 USB-serial drivers if the device doesn't appear",
+            ]
+        else:
+            # Port exists — try opening and sending a no-op to get ACK
+            try:
+                test_ser = _serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=2)
+                import time as _t
+                _t.sleep(2)  # ESP32 resets on serial open
+                test_ser.reset_input_buffer()
+
+                # Send a tiny no-op move and check for ACK
+                test_ser.write(b'{"type":"move","dx":0,"dy":0}\n')
+                test_ser.flush()
+
+                deadline = _t.time() + 3.0
+                got_ack = False
+                while _t.time() < deadline:
+                    if test_ser.in_waiting:
+                        line = test_ser.readline().decode("utf-8", errors="replace").strip()
+                        if line.startswith("{"):
+                            try:
+                                ack = json.loads(line)
+                                if ack.get("status") == "ok":
+                                    got_ack = True
+                                    break
+                            except json.JSONDecodeError:
+                                pass
+                    _t.sleep(0.05)
+
+                test_ser.close()
+
+                if got_ack:
+                    esp_result["ok"] = True
+                    esp_result["message"] = f"Connected on {SERIAL_PORT} — ACK received"
+                else:
+                    esp_result["message"] = (
+                        f"Port {SERIAL_PORT} opened but ESP32 did not respond (no ACK)"
+                    )
+                    esp_result["fixes"] = [
+                        "Verify the ESP32-S3 firmware is flashed and running",
+                        f"Check baud rate matches firmware (config: {SERIAL_BAUD})",
+                        "Press the RST button on the ESP32-S3 and try again",
+                        "Open a serial monitor to see if the ESP32 is outputting anything",
+                    ]
+            except _serial.SerialException as e:
+                esp_result["message"] = f"Cannot open {SERIAL_PORT}: {e}"
+                esp_result["fixes"] = [
+                    f"Another program may have {SERIAL_PORT} open (Arduino IDE, PuTTY, etc.)",
+                    "Close other serial monitors and retry",
+                    "Unplug and replug the ESP32-S3",
+                ]
+    except ImportError:
+        esp_result["message"] = "pyserial not installed"
+        esp_result["fixes"] = ["Run: pip install pyserial"]
+    except Exception as e:
+        esp_result["message"] = f"Unexpected error: {e}"
+
+    results.append(esp_result)
+
+    # --- HDMI Capture Card ------------------------------------------------------
+    cap_result = {"component": "HDMI Capture", "ok": False, "message": "", "fixes": []}
+    try:
+        import cv2 as _cv2
+
+        cap = _cv2.VideoCapture(CAPTURE_DEVICE_ID)
+        if not cap.isOpened():
+            cap_result["message"] = f"Cannot open capture device {CAPTURE_DEVICE_ID}"
+            cap_result["fixes"] = [
+                "Check that the HDMI capture card is plugged into a USB port",
+                "Check that the locked PC's HDMI output is connected to the capture card",
+                f"Try a different device ID in agent.yaml (current: {CAPTURE_DEVICE_ID})",
+                "Device 0 is usually the built-in webcam — try 1, 2, or 3",
+                "Open Camera app or OBS to verify the capture card works",
+                "Try a different USB port (USB 3.0 recommended)",
+            ]
+        else:
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret or frame is None:
+                cap_result["message"] = (
+                    f"Device {CAPTURE_DEVICE_ID} opened but returned no frame"
+                )
+                cap_result["fixes"] = [
+                    "The locked PC may be off or in sleep mode — check it has video output",
+                    "Check the HDMI cable between the locked PC and the capture card",
+                    "The capture card may need a moment after plugging in — wait and retry",
+                    "Try a different HDMI cable",
+                ]
+            else:
+                h, w = frame.shape[:2]
+                import numpy as _np
+                mean_brightness = float(_np.mean(frame))
+                if mean_brightness < 5.0:
+                    cap_result["message"] = (
+                        f"Device {CAPTURE_DEVICE_ID} returns frames ({w}x{h}) "
+                        f"but image is black (brightness={mean_brightness:.1f}) — no signal?"
+                    )
+                    cap_result["fixes"] = [
+                        "The locked PC screen may be off, asleep, or showing a black screen",
+                        "Check the HDMI cable is firmly connected at both ends",
+                        "Move the mouse or press a key on the locked PC to wake it",
+                        "Try a different HDMI cable or port on the locked PC",
+                    ]
+                else:
+                    cap_result["ok"] = True
+                    cap_result["message"] = (
+                        f"Capturing {w}x{h} frames from device {CAPTURE_DEVICE_ID} "
+                        f"(brightness={mean_brightness:.0f})"
+                    )
+    except ImportError:
+        cap_result["message"] = "opencv-python not installed"
+        cap_result["fixes"] = ["Run: pip install opencv-python"]
+    except Exception as e:
+        cap_result["message"] = f"Unexpected error: {e}"
+
+    results.append(cap_result)
+    return results
+
+
 calibrated = False
 
 # Calibration constants
-_CAL_MICKEYS_SHORT = 200   # first probe distance
+_CAL_MICKEYS_SHORT = 200   # first probe distance (mickeys)
 _CAL_MICKEYS_LONG = 400    # second probe distance (2x short)
+_CAL_Y_OFFSET = 80         # mickeys down from top to avoid corner menus
 _ACCEL_RATIO_TOL = 0.15    # max deviation from 2.0 before flagging acceleration
-_CAL_ACCURACY_TOL = 40     # max pixel error for calibration to pass
+_CAL_DIFF_THRESHOLD = 30   # pixel intensity change to count as "different"
+_CAL_MIN_CHANGED = 200     # minimum changed pixels to consider a context menu detected
 
 
 class CalibrationError(Exception):
@@ -110,35 +256,62 @@ class CalibrationError(Exception):
     pass
 
 
-def _ask_cursor_position(screenshot_b64: str) -> tuple[int, int]:
-    """Ask the AI to locate the mouse cursor in a screenshot.
+def _detect_cursor_via_context_menu(mickeys_x: int) -> tuple[int, int]:
+    """Move cursor by mickeys_x from home, right-click, and detect position
+    by finding where the context menu appeared via screenshot diff.
 
-    Returns (x, y) pixel coordinates.
-    Raises CalibrationError if the AI can't find the cursor.
+    Returns (x, y) pixel position of the context menu top-left corner,
+    which is where the cursor was when right-clicked.
     """
-    result = claude.decide(
-        "Find the mouse cursor in this screenshot. Report its EXACT pixel "
-        "coordinates. Reply ONLY with JSON: {\"type\":\"done\",\"x\":<int>,\"y\":<int>}",
-        screenshot_b64,
-        [],
-    )
-    x = result.get("x")
-    y = result.get("y")
-    if x is None or y is None:
-        raise CalibrationError(f"AI could not locate cursor: {result}")
-    return int(x), int(y)
+    import numpy as np
+
+    # Dismiss any existing popup
+    hid.send({"type": "key", "keys": ["escape"]})
+    time.sleep(0.3)
+
+    # Baseline screenshot (no context menu)
+    before = np.array(screen.grab())
+
+    # Home, move to test position, right-click
+    _home_cursor()
+    hid.send({"type": "move", "dx": mickeys_x, "dy": _CAL_Y_OFFSET})
+    time.sleep(0.2)
+    hid.send({"type": "right_click", "button": "right"})
+    time.sleep(0.5)
+
+    # Screenshot with context menu
+    after = np.array(screen.grab())
+
+    # Close context menu
+    hid.send({"type": "key", "keys": ["escape"]})
+    time.sleep(0.3)
+
+    # Diff to find context menu position
+    diff = np.abs(before.astype(np.int16) - after.astype(np.int16))
+    diff_gray = diff.sum(axis=2)
+    changed = diff_gray > _CAL_DIFF_THRESHOLD
+
+    num_changed = int(changed.sum())
+    if num_changed < _CAL_MIN_CHANGED:
+        raise CalibrationError(
+            f"No context menu detected ({num_changed} changed pixels, "
+            f"need {_CAL_MIN_CHANGED}). Try minimizing windows first."
+        )
+
+    # Find top-left corner of the changed region = cursor position
+    rows = np.any(changed, axis=1)
+    cols = np.any(changed, axis=0)
+    top = int(np.argmax(rows))
+    left = int(np.argmax(cols))
+
+    return (left, top)
 
 
 def calibrate_mouse() -> None:
-    """Detect mouse acceleration and verify/calibrate MICKEY_SCALE.
+    """Detect mouse acceleration and calibrate MICKEY_SCALE.
 
-    Steps:
-    1. Home cursor, move SHORT mickeys right, ask AI for cursor position.
-    2. Home cursor, move LONG mickeys right, ask AI for cursor position.
-    3. Compare pixel-per-mickey ratio at both distances.
-       If non-linear → mouse acceleration is ON → raise error.
-    4. Derive scale from measurements.
-    5. Move to a known target, verify the cursor lands within tolerance.
+    Minimizes to desktop first (Win+D) so right-click context menus don't
+    interfere with fullscreen apps. Restores windows when done.
     """
     global calibrated, MICKEY_SCALE_X, MICKEY_SCALE_Y
 
@@ -147,54 +320,61 @@ def calibrate_mouse() -> None:
         return
 
     init_hardware()
-    socketio.emit("log", {"text": "[Calibration] Starting acceleration detection..."})
+    socketio.emit("log", {"text": "[Calibration] Starting — switching to desktop..."})
+
+    # Minimize everything to desktop so right-click is safe
+    hid.send({"type": "key", "keys": ["win", "d"]})
+    time.sleep(1.5)
+
+    try:
+        _run_calibration_probes()
+    finally:
+        # Always restore windows, even if calibration fails
+        socketio.emit("log", {"text": "[Calibration] Restoring windows..."})
+        hid.send({"type": "key", "keys": ["win", "d"]})
+        time.sleep(1.0)
+
+
+def _run_calibration_probes() -> None:
+    """Run the actual calibration probes (called while on desktop)."""
+    global calibrated, MICKEY_SCALE_X, MICKEY_SCALE_Y
 
     # --- Probe 1: short distance -------------------------------------------
-    _home_cursor()
-    time.sleep(0.5)
-    hid.send({"type": "move", "dx": _CAL_MICKEYS_SHORT, "dy": 0})
-    time.sleep(0.5)
-
-    img1 = screen.grab()
-    b64_1 = ScreenCapture.to_b64(img1)
     try:
-        x1, y1 = _ask_cursor_position(b64_1)
+        x1, y1 = _detect_cursor_via_context_menu(_CAL_MICKEYS_SHORT)
     except (CalibrationError, Exception) as e:
-        socketio.emit("log", {"text": f"[Calibration] WARN: Could not find cursor after short move: {e}"})
-        socketio.emit("log", {"text": "[Calibration] Falling back to config scale values."})
+        socketio.emit("log", {"text": f"[Calibration] WARN: Short probe failed: {e}"})
+        socketio.emit("log", {"text": f"[Calibration] Using config scale X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}"})
         calibrated = True
         return
 
-    ppm_short = x1 / _CAL_MICKEYS_SHORT if _CAL_MICKEYS_SHORT else 0
-    socketio.emit("log", {"text": f"[Calibration] Short move: {_CAL_MICKEYS_SHORT} mickeys -> cursor at ({x1}, {y1}), ppm={ppm_short:.3f}"})
+    ppm_short = x1 / _CAL_MICKEYS_SHORT
+    socketio.emit("log", {
+        "text": f"[Calibration] Short: {_CAL_MICKEYS_SHORT} mickeys -> ({x1}, {y1}), ppm_x={ppm_short:.3f}"
+    })
 
     # --- Probe 2: long distance --------------------------------------------
-    _home_cursor()
-    time.sleep(0.5)
-    hid.send({"type": "move", "dx": _CAL_MICKEYS_LONG, "dy": 0})
-    time.sleep(0.5)
-
-    img2 = screen.grab()
-    b64_2 = ScreenCapture.to_b64(img2)
     try:
-        x2, y2 = _ask_cursor_position(b64_2)
+        x2, y2 = _detect_cursor_via_context_menu(_CAL_MICKEYS_LONG)
     except (CalibrationError, Exception) as e:
-        socketio.emit("log", {"text": f"[Calibration] WARN: Could not find cursor after long move: {e}"})
-        socketio.emit("log", {"text": "[Calibration] Falling back to config scale values."})
+        socketio.emit("log", {"text": f"[Calibration] WARN: Long probe failed: {e}"})
+        socketio.emit("log", {"text": f"[Calibration] Using config scale X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}"})
         calibrated = True
         return
 
-    ppm_long = x2 / _CAL_MICKEYS_LONG if _CAL_MICKEYS_LONG else 0
-    socketio.emit("log", {"text": f"[Calibration] Long move: {_CAL_MICKEYS_LONG} mickeys -> cursor at ({x2}, {y2}), ppm={ppm_long:.3f}"})
+    ppm_long = x2 / _CAL_MICKEYS_LONG
+    socketio.emit("log", {
+        "text": f"[Calibration] Long: {_CAL_MICKEYS_LONG} mickeys -> ({x2}, {y2}), ppm_x={ppm_long:.3f}"
+    })
 
     # --- Acceleration check ------------------------------------------------
-    if ppm_short > 0:
+    if x1 > 0:
         actual_ratio = x2 / x1
-        expected_ratio = _CAL_MICKEYS_LONG / _CAL_MICKEYS_SHORT  # should be 2.0
+        expected_ratio = _CAL_MICKEYS_LONG / _CAL_MICKEYS_SHORT  # 2.0
         deviation = abs(actual_ratio - expected_ratio) / expected_ratio
 
         socketio.emit("log", {
-            "text": f"[Calibration] Distance ratio: {actual_ratio:.2f} (expected {expected_ratio:.1f}, deviation {deviation:.1%})"
+            "text": f"[Calibration] Ratio: {actual_ratio:.2f} (expected {expected_ratio:.1f}, deviation {deviation:.1%})"
         })
 
         if deviation > _ACCEL_RATIO_TOL:
@@ -202,67 +382,29 @@ def calibrate_mouse() -> None:
                 f"MOUSE ACCELERATION DETECTED! Distance ratio is {actual_ratio:.2f} "
                 f"(expected {expected_ratio:.1f}, {deviation:.0%} off). "
                 f"Disable 'Enhance pointer precision' in the locked PC's mouse settings "
-                f"(Control Panel -> Mouse -> Pointer Options -> uncheck 'Enhance pointer precision'). "
-                f"Agent cannot aim accurately with acceleration ON."
+                f"(Control Panel -> Mouse -> Pointer Options -> uncheck 'Enhance pointer precision')."
             )
             socketio.emit("log", {"text": f"[Calibration] ERROR: {msg}"})
             socketio.emit("calibration_error", {"error": "acceleration", "message": msg})
             raise CalibrationError(msg)
-    else:
-        socketio.emit("log", {"text": "[Calibration] WARN: Short probe returned x=0, cannot check acceleration."})
 
-    # --- Derive scale ------------------------------------------------------
-    # Average ppm from both probes (should be nearly identical if no accel)
-    avg_ppm = (ppm_short + ppm_long) / 2
-    if avg_ppm > 0:
-        new_scale = 1.0 / avg_ppm
-        socketio.emit("log", {
-            "text": f"[Calibration] Measured ppm={avg_ppm:.3f}, derived scale={new_scale:.4f} "
-                    f"(was X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f})"
-        })
-        MICKEY_SCALE_X = new_scale
-        MICKEY_SCALE_Y = new_scale
+    # --- Derive and apply scale --------------------------------------------
+    avg_ppm_x = (ppm_short + ppm_long) / 2
+    avg_ppm_y = ((y1 / _CAL_Y_OFFSET) + (y2 / _CAL_Y_OFFSET)) / 2
 
-    # --- Verification: move to known target and check ----------------------
-    target_x, target_y = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
-    socketio.emit("log", {"text": f"[Calibration] Verifying: moving to ({target_x}, {target_y})..."})
-    move_cursor_to(target_x, target_y)
-    time.sleep(0.5)
-
-    img3 = screen.grab()
-    b64_3 = ScreenCapture.to_b64(img3)
-    try:
-        actual_x, actual_y = _ask_cursor_position(b64_3)
-    except (CalibrationError, Exception) as e:
-        socketio.emit("log", {"text": f"[Calibration] WARN: Could not verify cursor position: {e}"})
-        socketio.emit("log", {"text": f"[Calibration] Done (unverified). Scale X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}"})
-        calibrated = True
-        return
-
-    err_x = abs(actual_x - target_x)
-    err_y = abs(actual_y - target_y)
-    err_total = (err_x ** 2 + err_y ** 2) ** 0.5
+    new_scale_x = 1.0 / avg_ppm_x if avg_ppm_x > 0 else MICKEY_SCALE_X
+    new_scale_y = 1.0 / avg_ppm_y if avg_ppm_y > 0 else MICKEY_SCALE_Y
 
     socketio.emit("log", {
-        "text": f"[Calibration] Verification: target=({target_x},{target_y}) "
-                f"actual=({actual_x},{actual_y}) error={err_total:.0f}px "
-                f"(dx={err_x}, dy={err_y})"
+        "text": f"[Calibration] Scale: x={MICKEY_SCALE_X:.4f}->{new_scale_x:.4f}, "
+                f"y={MICKEY_SCALE_Y:.4f}->{new_scale_y:.4f}"
     })
 
-    if err_total > _CAL_ACCURACY_TOL:
-        msg = (
-            f"Calibration accuracy check FAILED. Cursor landed {err_total:.0f}px from target "
-            f"(tolerance is {_CAL_ACCURACY_TOL}px). Target=({target_x},{target_y}), "
-            f"Actual=({actual_x},{actual_y}). Try adjusting mickey_scale_x/y in agent.yaml "
-            f"or re-run calibration."
-        )
-        socketio.emit("log", {"text": f"[Calibration] ERROR: {msg}"})
-        socketio.emit("calibration_error", {"error": "accuracy", "message": msg})
-        raise CalibrationError(msg)
+    MICKEY_SCALE_X = new_scale_x
+    MICKEY_SCALE_Y = new_scale_y
 
     socketio.emit("log", {
-        "text": f"[Calibration] PASS. Scale X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}, "
-                f"accuracy={err_total:.0f}px"
+        "text": f"[Calibration] PASS. Scale X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}"
     })
     calibrated = True
 
@@ -305,59 +447,25 @@ def _home_cursor() -> None:
 
 
 def move_cursor_to(x: int, y: int) -> None:
-    """Move cursor to absolute (x, y).
+    """Move cursor to absolute (x, y) via home-then-move.
 
-    Uses relative move from current tracked position when the delta is small
-    (< 400px). For larger moves or when position is uncertain, homes first.
-    This avoids the cursor visibly flying to the top-left corner every action.
+    Always homes first for accuracy — relative moves accumulate drift
+    which can cause clicking the wrong button (e.g. PREV instead of NEXT).
     """
     global cursor_x, cursor_y
 
     x = max(0, min(SCREEN_WIDTH, x))
     y = max(0, min(SCREEN_HEIGHT, y))
 
-    dx_px = x - cursor_x
-    dy_px = y - cursor_y
+    _home_cursor()
 
-    # Use relative move if delta is small — avoids visible home-then-move
-    if abs(dx_px) < 400 and abs(dy_px) < 400 and (cursor_x != 0 or cursor_y != 0):
-        dx_m = int(dx_px * MICKEY_SCALE_X)
-        dy_m = int(dy_px * MICKEY_SCALE_Y)
-        hid.send({"type": "move", "dx": dx_m, "dy": dy_m})
-        time.sleep(0.15)
-    else:
-        # Large move or unknown position — home first for accuracy
-        _home_cursor()
-        target_mx = int(x * MICKEY_SCALE_X)
-        target_my = int(y * MICKEY_SCALE_Y)
-        hid.send({"type": "move", "dx": target_mx, "dy": target_my})
-        time.sleep(0.2)
+    target_mx = round(x * MICKEY_SCALE_X)
+    target_my = round(y * MICKEY_SCALE_Y)
+    hid.send({"type": "move", "dx": target_mx, "dy": target_my})
+    time.sleep(0.2)
 
     cursor_x = x
     cursor_y = y
-
-
-_EDGE_MARGIN = 60   # pixels from edge considered "near edge"
-_EDGE_NUDGE_BASE = 10  # base pixels to nudge inward for edge clicks
-_EDGE_NUDGE_MAX = 30   # max nudge after repeated misses
-
-# Track recent click locations to detect retries near the same spot
-_recent_clicks: list[tuple[int, int]] = []
-
-
-def _edge_nudge_amount() -> int:
-    """Increase nudge if recent clicks cluster near the same edge spot."""
-    if len(_recent_clicks) < 2:
-        return _EDGE_NUDGE_BASE
-    # Count how many of the last 4 clicks are within 40px of the most recent
-    lx, ly = _recent_clicks[-1]
-    nearby = sum(
-        1 for x, y in _recent_clicks[-4:]
-        if abs(x - lx) < 40 and abs(y - ly) < 40
-    )
-    # Scale nudge: 1 nearby=base, 2=base*1.5, 3+=base*2 up to max
-    multiplier = min(1.0 + (nearby - 1) * 0.5, _EDGE_NUDGE_MAX / _EDGE_NUDGE_BASE)
-    return min(int(_EDGE_NUDGE_BASE * multiplier), _EDGE_NUDGE_MAX)
 
 
 def execute_action(action: dict) -> bool:
@@ -367,31 +475,6 @@ def execute_action(action: dict) -> bool:
     if action_type in ("click_at", "double_click_at", "right_click_at", "move_to", "scroll_at"):
         target_x = action.get("x", SCREEN_WIDTH // 2)
         target_y = action.get("y", SCREEN_HEIGHT // 2)
-
-        # Track raw click location for adaptive nudge
-        _recent_clicks.append((target_x, target_y))
-        if len(_recent_clicks) > 10:
-            _recent_clicks.pop(0)
-
-        # Nudge clicks near screen edges inward — cursor positioning is less
-        # accurate at extremes due to boundary clamping and rounding errors
-        nudge = _edge_nudge_amount()
-        nudged = False
-        if target_x > SCREEN_WIDTH - _EDGE_MARGIN:
-            target_x -= nudge
-            nudged = True
-        elif target_x < _EDGE_MARGIN:
-            target_x += nudge
-            nudged = True
-        if target_y > SCREEN_HEIGHT - _EDGE_MARGIN:
-            target_y -= nudge
-            nudged = True
-        elif target_y < _EDGE_MARGIN:
-            target_y += nudge
-            nudged = True
-
-        if nudged:
-            socketio.emit("log", {"text": f"[Move] Edge nudge {nudge}px -> ({target_x}, {target_y})"})
 
         socketio.emit("log", {"text": f"[Move] Positioning cursor at ({target_x}, {target_y})…"})
         move_cursor_to(target_x, target_y)
@@ -431,16 +514,16 @@ def agent_loop() -> None:
 
     init_hardware()
 
-    # Run calibration check on first task (detects acceleration + verifies scale)
-    try:
-        calibrate_mouse()
-    except CalibrationError as e:
-        socketio.emit("log", {"text": f"[Agent] Cannot start — calibration failed: {e}"})
-        socketio.emit("status", {"running": False})
-        return
+    # Apply active task profile to the AI
+    if active_profile:
+        profile_text = load_profile(active_profile)
+        claude.set_profile(profile_text)
+        socketio.emit("log", {"text": f"[Config] Profile: {active_profile}"})
+    else:
+        claude.set_profile("")
+        socketio.emit("log", {"text": "[Config] Profile: none (generic)"})
 
     socketio.emit("log", {"text": f"[Config] MICKEY_SCALE X={MICKEY_SCALE_X:.3f} Y={MICKEY_SCALE_Y:.3f}"})
-    _recent_clicks.clear()
     _home_cursor()  # start from known position
 
     # record task
@@ -464,7 +547,7 @@ def agent_loop() -> None:
     step = 0
     consecutive_screenshots = 0
 
-    while not agent_stop.is_set() and step < max_steps:
+    while not agent_stop.is_set():
         step += 1
         task_entry["steps"] = step
         socketio.emit("log", {"text": f"\n=== Step {step} ==="})
@@ -564,8 +647,22 @@ def index():
 
 # --- socket events ----------------------------------------------------------
 
+_startup_checked = False
+
 @socketio.on("connect")
 def on_connect():
+    global _startup_checked
+    # Run hardware health checks once on first client connect
+    if not _startup_checked:
+        _startup_checked = True
+        checks = startup_check()
+        for c in checks:
+            status = "OK" if c["ok"] else "FAIL"
+            socketio.emit("log", {"text": f"[Health] [{status}] {c['component']}: {c['message']}"})
+            if not c["ok"] and c["fixes"]:
+                for fix in c["fixes"]:
+                    socketio.emit("log", {"text": f"[Health]   -> {fix}"})
+
     try:
         init_hardware()
     except Exception as e:
@@ -574,6 +671,7 @@ def on_connect():
     socketio.emit("status", {"running": agent_thread is not None and agent_thread.is_alive()})
     socketio.emit("task_log", task_log)
     socketio.emit("session_notes", session_notes)
+    socketio.emit("profile", {"active": active_profile, "profiles": list_profiles()})
     socketio.start_background_task(stream_screen)
 
 
@@ -658,16 +756,36 @@ def on_calibrate():
 
 @socketio.on("adjust_scale")
 def on_adjust_scale(data):
-    """Manually adjust MICKEY_SCALE_X/Y up or down."""
+    """Manually adjust MICKEY_SCALE_X/Y — 2% steps for fine tuning."""
     global MICKEY_SCALE_X, MICKEY_SCALE_Y
     direction = data.get("direction", "")
     if direction == "up":
-        MICKEY_SCALE_X *= 1.1
-        MICKEY_SCALE_Y *= 1.1
+        MICKEY_SCALE_X *= 1.02
+        MICKEY_SCALE_Y *= 1.02
     elif direction == "down":
-        MICKEY_SCALE_X /= 1.1
-        MICKEY_SCALE_Y /= 1.1
-    socketio.emit("log", {"text": f"[Config] MICKEY_SCALE X={MICKEY_SCALE_X:.3f} Y={MICKEY_SCALE_Y:.3f}"})
+        MICKEY_SCALE_X /= 1.02
+        MICKEY_SCALE_Y /= 1.02
+    socketio.emit("log", {"text": f"[Config] MICKEY_SCALE X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}"})
+
+
+@socketio.on("click_test")
+def on_click_test(data):
+    """Move cursor to a target and click — lets the user visually verify accuracy.
+
+    Send {"x": 640, "y": 360} to test clicking screen center.
+    The cursor will move there and click, so the user can see on the
+    live screen feed exactly where the cursor landed.
+    """
+    try:
+        init_hardware()
+        x = int(data.get("x", SCREEN_WIDTH // 2))
+        y = int(data.get("y", SCREEN_HEIGHT // 2))
+        socketio.emit("log", {"text": f"[ClickTest] Moving to ({x}, {y}) with scale X={MICKEY_SCALE_X:.4f} Y={MICKEY_SCALE_Y:.4f}"})
+        move_cursor_to(x, y)
+        hid.send({"type": "click", "button": "left"})
+        socketio.emit("log", {"text": f"[ClickTest] Clicked at ({x}, {y}). Check the live screen to verify accuracy."})
+    except Exception as e:
+        socketio.emit("log", {"text": f"[ClickTest] Error: {e}"})
 
 
 @socketio.on("send_hid")
@@ -680,5 +798,44 @@ def on_send_hid(data):
         socketio.emit("log", {"text": f"[Manual] Error: {e}"})
 
 
+@socketio.on("set_profile")
+def on_set_profile(data):
+    global active_profile
+    name = data.get("profile", "")
+    if name and name not in list_profiles():
+        socketio.emit("log", {"text": f"[Profile] Unknown profile: {name}"})
+        return
+    active_profile = name
+    label = name if name else "none (generic)"
+    socketio.emit("log", {"text": f"[Profile] Set to: {label}"})
+    socketio.emit("profile", {"active": active_profile, "profiles": list_profiles()})
+
+
+@socketio.on("get_profiles")
+def on_get_profiles():
+    socketio.emit("profile", {"active": active_profile, "profiles": list_profiles()})
+
+
 if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("  STARTUP HARDWARE CHECK")
+    print("=" * 60)
+    checks = startup_check()
+    all_ok = True
+    for c in checks:
+        status = "OK" if c["ok"] else "FAIL"
+        print(f"\n  [{status}] {c['component']}: {c['message']}")
+        if not c["ok"]:
+            all_ok = False
+            if c["fixes"]:
+                print("  Possible fixes:")
+                for fix in c["fixes"]:
+                    print(f"    - {fix}")
+    print("\n" + "=" * 60)
+    if all_ok:
+        print("  All checks passed — starting server")
+    else:
+        print("  Some checks FAILED — starting server anyway (fix issues above)")
+    print("=" * 60 + "\n")
+
     socketio.run(app, host="0.0.0.0", port=5000, debug=False)

@@ -1,0 +1,46 @@
+E-LEARNING / TRAINING COURSE RULES:
+
+NEVER GO BACKWARD:
+  - NEVER click sidebar/menu items for lessons or sections you have ALREADY
+    completed or that appear BEFORE your current position.
+  - If a sidebar shows lessons 1-5 and you are on lesson 4, NEVER click
+    lessons 1, 2, or 3. Only click lesson 5 or later if needed.
+  - If you accidentally go backward, immediately click NEXT or use the
+    sidebar to return to where you were.
+  - The sidebar/menu is for reference — your PRIMARY navigation is the
+    NEXT button. Only use the sidebar to jump FORWARD, never backward.
+
+NUMBERED CIRCLES / HOTSPOTS (CRITICAL — this is the #1 blocker):
+  Training slides frequently have numbered circles, hotspots, or tiles
+  labeled 1, 2, 3, 4, 5, 6 etc. These are MANDATORY interactive elements.
+  - You MUST click EVERY numbered element, starting from 1.
+  - After clicking one: a popup, inset, or detail panel will appear.
+    Read it, then dismiss it (click "X", "Close", "Return to main slide",
+    or click the next number directly).
+  - Then click the next number: 2, then 3, then 4, etc.
+  - NEXT will NOT activate until you have clicked ALL numbers.
+  - If you click one and nothing seems to happen, look for content that
+    appeared in a panel or overlay — you may need to scroll within it
+    or close it before the next number becomes clickable.
+  - Do NOT skip numbers. Do NOT try NEXT before finishing all of them.
+
+WHEN NEXT BUTTON DOES NOT WORK — diagnose in this order:
+  1. NUMBERED ELEMENTS: Are there numbered circles/hotspots on the slide
+     you haven't clicked? Click ALL of them in order. This is the answer
+     90% of the time.
+  2. WAIT: A video or animation may need to finish first.
+     Use {"type":"wait","duration":15} and try NEXT again after.
+     If you already waited once and it didn't help, do NOT wait again.
+  3. INTERACT: Look for other clickable items ON the slide itself
+     — tiles, tabs, expandable sections, checkboxes, or "Submit" buttons.
+  4. SCROLL DOWN: Check for content or controls below the visible area.
+  5. ANSWER A QUESTION: An unanswered quiz or knowledge check may be
+     blocking progression.
+  Do NOT click sidebar items when NEXT doesn't work. The problem is almost
+  always on the CURRENT page, not in the navigation menu.
+
+QUIZZES AND QUESTIONS:
+  - Read the FULL question and ALL answer choices before selecting.
+  - Think about what the training material covered — match key terms.
+  - If wrong and you can retry, the feedback often hints at the answer.
+  - Watch for traps: "all of the above," absolutes like "never"/"always."

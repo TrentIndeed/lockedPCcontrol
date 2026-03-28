@@ -7,7 +7,9 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from project root (one level up from agent/)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 # ---------------------------------------------------------------------------
 # Load YAML config
@@ -85,3 +87,29 @@ if os.path.exists(_PROMPT_FILE):
         SYSTEM_PROMPT: str = f.read()
 else:
     SYSTEM_PROMPT: str = ""
+
+# ---------------------------------------------------------------------------
+# Task profiles — optional extra instructions appended to the system prompt
+# ---------------------------------------------------------------------------
+
+PROFILES_DIR: str = os.path.join(_BASE_DIR, "profiles")
+
+
+def list_profiles() -> list[str]:
+    """Return available profile names (filename without extension)."""
+    if not os.path.isdir(PROFILES_DIR):
+        return []
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(PROFILES_DIR)
+        if f.endswith(".txt")
+    )
+
+
+def load_profile(name: str) -> str:
+    """Load a profile's text by name. Returns empty string if not found."""
+    path = os.path.join(PROFILES_DIR, f"{name}.txt")
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
